@@ -30,12 +30,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <generator>
 #include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "cc_coro.h"
 #include "cc_entry.h"
 #include "cc_map.h"
 #include "cc_page_clean_guard.h"
@@ -1399,6 +1401,28 @@ public:
             hd_res->SetError(CcErrorCode::REQUESTED_TABLE_SCHEMA_MISMATCH);
             return true;
         }
+
+#if __cplusplus >= 202302L
+        req.SetNodeGroupTerm(ng_term);
+
+        bool finish = false;
+        CcCoro::uptr coro = req.GetCcCoro();
+        if (coro == nullptr)
+        {
+            coro = shard_->NewCcCoro();
+            finish = coro->Start(Read(std::allocator_arg,
+                                      std::pmr::polymorphic_allocator<bool>{
+                                          shard_->GetSharedAllocator()},
+                                      req));
+        }
+        else
+        {
+            finish = coro->Resume();
+        }
+
+        req.SetCcCoro(std::move(coro));
+        return finish;
+#endif
 
         IsolationLevel iso_lvl = req.Isolation();
         CcProtocol cc_proto = req.Protocol();
@@ -5880,7 +5904,7 @@ public:
         };
 
         auto check_split_slice =
-            [this, &req](std::vector<TxKey>::const_iterator &slice_it) -> bool
+            [&req](std::vector<TxKey>::const_iterator &slice_it) -> bool
         {
             const StoreSlice *slice = req.StoreRangePtr()->FindSlice(*slice_it);
 
@@ -11069,7 +11093,8 @@ protected:
             // then the record is regard as nonexistent. Note that the slice is
             // fully cached.
             if (v_rec.payload_status_ == RecordStatus::Unknown ||
-                v_rec.payload_status_ == RecordStatus::Deleted && !keep_deleted)
+                (v_rec.payload_status_ == RecordStatus::Deleted &&
+                 !keep_deleted))
             {
                 return;
             }
@@ -11240,7 +11265,8 @@ protected:
             // then the record is regard as nonexistent. Note the slice is fully
             // cached.
             if (v_rec.payload_status_ == RecordStatus::Unknown ||
-                v_rec.payload_status_ == RecordStatus::Deleted && !keep_deleted)
+                (v_rec.payload_status_ == RecordStatus::Deleted &&
+                 !keep_deleted))
             {
                 return;
             }
@@ -12032,6 +12058,651 @@ protected:
         return &pos_inf_page_;
     }
 
+    enum struct SearchKeyResult : uint8_t
+    {
+        Found = 0,
+        NotFound,
+        LoadSlice,
+        Retry,
+        Migrating,
+        Error,
+        StorageUnknown
+    };
+
+    SearchKeyResult SearchKey(
+        const KeyT &key,
+        ReadCc &req,
+        CcEntry<KeyT, ValueT, VersionedRecord, RangePartitioned> *&cce,
+        CcPage<KeyT, ValueT, VersionedRecord, RangePartitioned> *&ccp)
+    {
+        Iterator it = Find(key);
+        cce = it->second;
+        ccp = it.GetPage();
+
+        // The search key is found in ccm
+        if (cce != nullptr && cce->PayloadStatus() != RecordStatus::Unknown)
+        {
+            return SearchKeyResult::Found;
+        }
+
+        assert(Type() == TableType::Primary ||
+               Type() == TableType::UniqueSecondary);
+
+        RangeSliceOpStatus pin_status;
+        RangeSliceId slice_id = shard_->local_shards_.PinRangeSlice(
+            table_name_,
+            cc_ng_id_,
+            req.NodeGroupTerm(),
+            KeySchema(),
+            RecordSchema(),
+            schema_ts_,
+            table_schema_->GetKVCatalogInfo(),
+            req.PartitionId(),
+            key,
+            true,
+            &req,
+            shard_,
+            pin_status,
+            false,
+            0,
+            txservice_enable_key_cache && Type() == TableType::Primary,
+            req.PointReadOnCacheMiss());
+
+        switch (pin_status)
+        {
+        case RangeSliceOpStatus::Successful:
+            // The slice is fully cached, so the key must not exist.
+        case RangeSliceOpStatus::KeyNotExists:
+        {
+            SearchKeyResult ret = SearchKeyResult::NotFound;
+            // If the request is read-for-write for a non-existent key, it
+            // inserts the new key into the ccm. Adds the key to the cuckoo key
+            // cache too.
+            if (txservice_enable_key_cache && table_name_.IsBase() &&
+                req.IsForWrite())
+            {
+                TemplateStoreRange<KeyT> *range =
+                    static_cast<TemplateStoreRange<KeyT> *>(slice_id.Range());
+                auto res =
+                    range->AddKey(key, shard_->core_id_, slice_id.Slice());
+                if (res == RangeSliceOpStatus::Error)
+                {
+                    // Key cache is invalidated due to collision.
+                    // Try to add the cached slices back to the key
+                    // cache.
+                    range->InitKeyCache(
+                        shard_, &table_name_, cc_ng_id_, req.NodeGroupTerm());
+                }
+                else if (res == RangeSliceOpStatus::Retry)
+                {
+                    ret = SearchKeyResult::Retry;
+                }
+            }
+
+            // The slice is unpinned immediately. This is because the pin
+            // operation brings all records in the slice into memory, including
+            // the target record sharded to this core. Since cache cleaning is
+            // done by the tx processor associated with this core, the target
+            // record cannot be kicked out before this request finishes.
+            if (pin_status == RangeSliceOpStatus::Successful)
+            {
+                slice_id.Unpin();
+            }
+
+            return ret;
+        }
+        case RangeSliceOpStatus::BlockedOnLoad:
+            return SearchKeyResult::LoadSlice;
+        case RangeSliceOpStatus::Retry:
+            return SearchKeyResult::Retry;
+        case RangeSliceOpStatus::Delay:
+            return slice_id.Range()->HasLock() ? SearchKeyResult::Migrating
+                                               : SearchKeyResult::Retry;
+        case RangeSliceOpStatus::Error:
+            return SearchKeyResult::Error;
+        case RangeSliceOpStatus::NotPinned:
+            // The slice is partially cached but is not loaded from storage.
+            return SearchKeyResult::StorageUnknown;
+        default:
+            return SearchKeyResult::Error;
+        }
+    }
+
+    bool SearchEmplaceKey(
+        const KeyT &key,
+        CcEntry<KeyT, ValueT, VersionedRecord, RangePartitioned> *&cce,
+        CcPage<KeyT, ValueT, VersionedRecord, RangePartitioned> *&ccp,
+        bool read_only)
+    {
+        Iterator it = FindEmplace(key, false, read_only);
+        cce = it->second;
+        ccp = it.GetPage();
+
+        // The cce is null when the cc map is full and cannot allocates a
+        // new entry.
+        return cce != nullptr;
+    }
+
+    std::generator<bool> Read(std::allocator_arg_t,
+                              std::pmr::polymorphic_allocator<bool> alloc,
+                              ReadCc &req)
+    {
+        auto hd_res = req.Result();
+        int64_t ng_term = req.NodeGroupTerm();
+        uint32_t ng_id = req.NodeGroupId();
+
+        IsolationLevel iso_lvl = req.Isolation();
+        CcProtocol cc_proto = req.Protocol();
+        bool is_read_snapshot;
+        CcOperation cc_op;
+        if (table_name_.Type() == TableType::Secondary)
+        {
+            assert(false);
+            cc_op = CcOperation::ReadSkIndex;
+            is_read_snapshot = (iso_lvl == IsolationLevel::Snapshot);
+        }
+        else if (table_name_.Type() == TableType::UniqueSecondary)
+        {
+            cc_op = req.IsForWrite() ? CcOperation::ReadForWrite
+                                     : CcOperation::ReadSkIndex;
+            is_read_snapshot =
+                (iso_lvl == IsolationLevel::Snapshot && !req.IsForWrite());
+        }
+        else
+        {
+            cc_op = req.IsForWrite() ? CcOperation::ReadForWrite
+                                     : CcOperation::Read;
+            is_read_snapshot =
+                (iso_lvl == IsolationLevel::Snapshot && !req.IsForWrite());
+        }
+
+        CcEntryAddr &cce_addr = hd_res->Value().cce_addr_;
+        CcEntry<KeyT, ValueT, VersionedRecord, RangePartitioned> *cce = nullptr;
+        CcPage<KeyT, ValueT, VersionedRecord, RangePartitioned> *ccp = nullptr;
+        const KeyT *look_key = nullptr;
+        KeyT decoded_key;
+
+        LockType acquired_lock = LockType::NoLock;
+        CcErrorCode err_code = CcErrorCode::NO_ERROR;
+
+        // Prepares the search key
+        if (req.Key() != nullptr)
+        {
+            look_key = static_cast<const KeyT *>(req.Key());
+        }
+        else
+        {
+            assert(req.KeyBlob() != nullptr);
+            size_t offset = 0;
+            decoded_key.Deserialize(req.KeyBlob()->data(), offset, KeySchema());
+            look_key = &decoded_key;
+        }
+
+        CODE_FAULT_INJECTOR("remote_read_msg_missed", {
+            LOG(INFO) << "FaultInject  remote_read_msg_missed"
+                      << "txID: " << req.Txn();
+            if (!req.IsLocal())
+            {
+                remote::RemoteRead &remote_req =
+                    static_cast<remote::RemoteRead &>(req);
+                remote_req.Acknowledge();
+            }
+
+            co_yield true;
+        });
+
+        bool search_finish = true;
+        do
+        {
+            cce = nullptr;
+            ccp = nullptr;
+            if (RangePartitioned)
+            {
+                SearchKeyResult ret = SearchKey(*look_key, req, cce, ccp);
+
+                // Collects cache hit/miss metrics.
+                if (metrics::enable_cache_hit_rate &&
+                    !req.CacheHitMissCollected())
+                {
+                    if (ret == SearchKeyResult::Found ||
+                        ret == SearchKeyResult::NotFound)
+                    {
+                        shard_->CollectCacheHit();
+                    }
+                    else
+                    {
+                        shard_->CollectCacheMiss();
+                    }
+                    req.SetCacheHitMissCollected();
+                }
+
+                switch (ret)
+                {
+                case SearchKeyResult::Found:
+                    search_finish = true;
+                    break;
+                case SearchKeyResult::NotFound:
+                {
+                    if (cc_op != CcOperation::ReadForWrite)
+                    {
+                        // The read is not for update. Reading a
+                        // non-existent key does not put a lock on it.
+                        hd_res->Value().ts_ = 1;
+                        hd_res->Value().rec_status_ = RecordStatus::Deleted;
+                        hd_res->SetFinished();
+                        co_yield true;
+                    }
+
+                    // The request is a read-for-write for a non-existent
+                    // key. Creates a new cc entry for the key.
+                    if (cce == nullptr)
+                    {
+                        bool success =
+                            SearchEmplaceKey(*look_key, cce, ccp, false);
+                        if (!success)
+                        {
+                            shard_->EnqueueWaitListIfMemoryFull(&req);
+                            search_finish = false;
+                            co_yield false;
+                            continue;
+                        }
+                    }
+                    // Marks the key as deleted.
+                    cce->SetCommitTsPayloadStatus(1U, RecordStatus::Deleted);
+                    cce->SetCkptTs(1U);
+                    cce->entry_info_.SetDataStoreSize(0);
+                    search_finish = true;
+                    break;
+                }
+                case SearchKeyResult::LoadSlice:
+                    // The slice is being loaded. Waits until the slice is
+                    // loaded.
+                    search_finish = false;
+                    co_yield false;
+                    break;
+                case SearchKeyResult::Retry:
+                    shard_->Enqueue(shard_->LocalCoreId(), &req);
+                    search_finish = false;
+                    co_yield false;
+                    break;
+                case SearchKeyResult::Migrating:
+                    // The slice is waiting to be migrated. Fails this read
+                    // request to unblock slice migration.
+                    hd_res->SetError(CcErrorCode::OUT_OF_MEMORY);
+                    co_yield true;
+                    break;
+                case SearchKeyResult::StorageUnknown:
+                {
+                    assert(req.PointReadOnCacheMiss());
+                    if (cce == nullptr)
+                    {
+                        bool success =
+                            SearchEmplaceKey(*look_key, cce, ccp, false);
+                        if (!success)
+                        {
+                            shard_->EnqueueWaitListIfMemoryFull(&req);
+                            search_finish = false;
+                            co_yield false;
+                            continue;
+                        }
+                    }
+                    assert(cce->PayloadStatus() == RecordStatus::Unknown);
+
+                    // Create key lock and extra struct for the cce. Fetch
+                    // record will pin the cce to prevent it from being
+                    // recycled before fetch record returns.
+                    cce->GetOrCreateKeyLock(shard_, this, ccp);
+                    auto fetch_ret_status = shard_->FetchRecord(
+                        this->table_name_,
+                        this->table_schema_,
+                        TxKey(look_key),
+                        cce,
+                        this->cc_ng_id_,
+                        ng_term,
+                        &req,
+                        req.PartitionId(),
+                        false,
+                        0,
+                        is_read_snapshot ? req.ReadTimestamp() : 0,
+                        false);
+
+                    if (fetch_ret_status ==
+                        store::DataStoreHandler::DataStoreOpStatus::Retry)
+                    {
+                        // Yield and retry
+                        shard_->Enqueue(shard_->core_id_, &req);
+                        search_finish = false;
+                        co_yield false;
+                    }
+                    else
+                    {
+                        co_yield false;
+                        // Upon resumption, the record is fetched from
+                        // storage.
+                        assert(cce->PayloadStatus() != RecordStatus::Unknown);
+                        search_finish = true;
+                        cce->GetKeyGapLockAndExtraData()->ReleasePin();
+                        cce->RecycleKeyLock(*shard_);
+                    }
+                    break;
+                }
+                case SearchKeyResult::Error:
+                    // If the search operation returns an error, the data
+                    // store is inaccessible.
+                    hd_res->SetError(CcErrorCode::PIN_RANGE_SLICE_FAILED);
+                    co_yield true;
+                    break;
+                default:
+                    search_finish = true;
+                    break;
+                }
+            }
+            else
+            {
+                bool success =
+                    SearchEmplaceKey(*look_key, cce, ccp, !req.IsForWrite());
+                if (!success)
+                {
+                    shard_->EnqueueWaitListIfMemoryFull(&req);
+                    search_finish = false;
+                    co_yield false;
+                    continue;
+                }
+
+                // if ccm contains all the ccentries, then unknown status
+                // means that we can skip accessing kv store and return
+                // deleted status directly.
+                if (ccm_has_full_entries_ &&
+                    cce->PayloadStatus() == RecordStatus::Unknown)
+                {
+                    cce->SetCommitTsPayloadStatus(1U, RecordStatus::Deleted);
+                    cce->SetCkptTs(1U);
+                }
+
+                if (metrics::enable_cache_hit_rate &&
+                    !req.CacheHitMissCollected())
+                {
+                    if (cce->PayloadStatus() == RecordStatus::Unknown)
+                    {
+                        shard_->CollectCacheMiss();
+                    }
+                    else
+                    {
+                        shard_->CollectCacheHit();
+                    }
+                    req.SetCacheHitMissCollected();
+                }
+
+                if (cce->PayloadStatus() != RecordStatus::Unknown)
+                {
+                    break;
+                }
+
+                // Create key lock and extra struct for the cce. Fetch
+                // record will pin the cce to prevent it from being recycled
+                // before fetch record returns.
+                cce->GetOrCreateKeyLock(shard_, this, ccp);
+                auto fetch_ret_status = shard_->FetchRecord(
+                    this->table_name_,
+                    this->table_schema_,
+                    TxKey(look_key),
+                    cce,
+                    this->cc_ng_id_,
+                    ng_term,
+                    &req,
+                    req.PartitionId(),
+                    false,
+                    0U,
+                    is_read_snapshot ? req.ReadTimestamp() : 0,
+                    false);
+
+                if (fetch_ret_status ==
+                    store::DataStoreHandler::DataStoreOpStatus::Retry)
+                {
+                    // Yield and retry
+                    shard_->Enqueue(shard_->core_id_, &req);
+                    search_finish = false;
+                    co_yield false;
+                }
+                else
+                {
+                    co_yield false;
+                    // Upon resumption, the record is fetched from storage.
+                    assert(cce->PayloadStatus() != RecordStatus::Unknown);
+                    search_finish = true;
+                    cce->GetKeyGapLockAndExtraData()->ReleasePin();
+                    cce->RecycleKeyLock(*shard_);
+                }
+            }
+        } while (!search_finish);
+
+        CODE_FAULT_INJECTOR("remote_read_msg_missed", {
+            LOG(INFO) << "FaultInject  remote_read_msg_missed"
+                      << "txID: " << req.Txn();
+            if (!req.IsLocal())
+            {
+                remote::RemoteRead &remote_req =
+                    static_cast<remote::RemoteRead &>(req);
+                remote_req.Acknowledge();
+            }
+
+            co_yield true;
+        });
+
+        if (req.Isolation() == IsolationLevel::Snapshot)
+        {
+            // MVCC update last_read_ts_ of lastest ccentry to tell later
+            // writer's commit_ts must be higher than MVCC reader's ts. Or
+            // it will break the REPEATABLE READ since the next MVCC read in
+            // the same transaction will read the new updated ccentry.
+            shard_->UpdateLastReadTs(req.ReadTimestamp());
+        }
+        std::tie(acquired_lock, err_code) =
+            AcquireCceKeyLock(cce,
+                              cce->CommitTs(),
+                              ccp,
+                              cce->PayloadStatus(),
+                              &req,
+                              ng_id,
+                              ng_term,
+                              req.TxTerm(),
+                              cc_op,
+                              iso_lvl,
+                              cc_proto,
+                              req.ReadTimestamp(),
+                              req.IsCoveringKeys());
+
+        cce_addr.SetCceLock(
+            reinterpret_cast<uint64_t>(cce->GetKeyGapLockAndExtraData()),
+            ng_term,
+            req.NodeGroupId(),
+            shard_->LocalCoreId());
+
+        // Handles the lock result
+        switch (err_code)
+        {
+        case CcErrorCode::MVCC_READ_MUST_WAIT_WRITE:
+        {
+            // The read yields and waits for the ongoing write.
+            co_yield false;
+            // Since when we are waiting for PostWrite, the ReadCc request
+            // is put into the blocking queue with ReadLock. After PostWrite
+            // finished, this ReadLock should be released.
+            cce->GetKeyLock()->ReleaseReadLock(req.Txn(), shard_);
+            break;
+        }
+        case CcErrorCode::NO_ERROR:
+        {
+            hd_res->Value().lock_type_ = acquired_lock;
+            break;
+        }
+        case CcErrorCode::ACQUIRE_LOCK_BLOCKED:
+        {
+            // If the read request comes from a remote node, sends
+            // acknowledgement to the sender when the request is blocked.
+            if (!req.IsLocal())
+            {
+                remote::RemoteRead &remote_req =
+                    static_cast<remote::RemoteRead &>(req);
+                remote_req.Acknowledge();
+            }
+            // ReadLock fail should stop the execution of current
+            // ReadCc request since it's already in blocking queue.
+            co_yield false;
+            std::tie(acquired_lock, err_code) =
+                LockHandleForResumedRequest(cce,
+                                            cce->CommitTs(),
+                                            cce->PayloadStatus(),
+                                            &req,
+                                            ng_id,
+                                            ng_term,
+                                            req.TxTerm(),
+                                            cc_op,
+                                            iso_lvl,
+                                            cc_proto,
+                                            req.ReadTimestamp(),
+                                            req.IsCoveringKeys());
+            break;
+        }
+        default:
+        {
+            // lock confilct: back off and retry.
+            req.Result()->SetError(err_code);
+            co_yield true;
+        }
+        }  //-- end: handles the lock result
+
+        // Copies the result into the request
+        if (is_read_snapshot && VersionedRecord)
+        {
+            VersionResultRecord<ValueT> v_rec;
+            while (true)
+            {
+                cce->MvccGet(req.ReadTimestamp(), v_rec);
+                if (v_rec.payload_status_ == RecordStatus::Normal)
+                {
+                    if (req.Record() != nullptr)
+                    {
+                        ValueT *typed_rec = static_cast<ValueT *>(req.Record());
+                        *typed_rec = *(v_rec.payload_ptr_);
+                    }
+                    else
+                    {
+                        assert(req.RecordBlob() != nullptr);
+                        v_rec.payload_ptr_->Serialize(*req.RecordBlob());
+                    }
+                }
+
+                if (metrics::enable_cache_hit_rate &&
+                    !req.CacheHitMissCollected())
+                {
+                    if (v_rec.payload_status_ == RecordStatus::Unknown ||
+                        v_rec.payload_status_ == RecordStatus::VersionUnknown ||
+                        v_rec.payload_status_ == RecordStatus::BaseVersionMiss)
+                    {
+                        shard_->CollectCacheMiss();
+                    }
+                    req.SetCacheHitMissCollected();
+                }
+                assert(v_rec.payload_status_ != RecordStatus::Unknown);
+
+                if (v_rec.payload_status_ != RecordStatus::VersionUnknown &&
+                    v_rec.payload_status_ != RecordStatus::BaseVersionMiss &&
+                    v_rec.payload_status_ != RecordStatus::ArchiveVersionMiss)
+                {
+                    break;
+                }
+
+                cce->GetOrCreateKeyLock(shard_, this, ccp);
+                auto fetch_ret_status = shard_->FetchRecord(
+                    this->table_name_,
+                    this->table_schema_,
+                    TxKey(look_key),
+                    cce,
+                    this->cc_ng_id_,
+                    ng_term,
+                    &req,
+                    req.PartitionId(),
+                    false,
+                    0U,
+                    req.ReadTimestamp(),
+                    v_rec.payload_status_ == RecordStatus::ArchiveVersionMiss);
+
+                assert(fetch_ret_status ==
+                       store::DataStoreHandler::DataStoreOpStatus::Success);
+                (void) fetch_ret_status;
+
+                co_yield false;  // Asks Zhongxin
+                cce->GetKeyGapLockAndExtraData()->ReleasePin();
+                cce->RecycleKeyLock(*shard_);
+            }
+
+            hd_res->Value().ts_ = v_rec.commit_ts_;
+            hd_res->Value().rec_status_ = v_rec.payload_status_;
+            hd_res->SetFinished();
+            co_yield true;
+        }
+        else if (cce->PayloadStatus() == RecordStatus::Normal &&
+                 (req.Type() == ReadType::Inside || cce->CommitTs() > 1))
+        {
+            // Copies the newest committed payload to the read result, if
+            // (1) this is a read request that starts concurrency control
+            // for the input key (i.e., read inside), or (2) this is a read
+            // request that brings in the record from the data store for
+            // caching, but the key has been updated by another committed tx
+            // since the first read request.
+            // TODO: TxExecution and runtime also use this new value as read
+            // result to avoid future PostRead abort.
+
+            if (req.Isolation() == IsolationLevel::ReadCommitted &&
+                cce->CommitTs() > 0 && cce->CommitTs() < req.ReadTimestamp())
+            {
+                // When backtracking the content of primary key record
+                // according to the secondary index key, if the commit_ts of
+                // this primary key record is smaller than the commit_ts of
+                // the secondary index key("req.ReadTimestamp()"), it means
+                // that the current primary key has not been updated and
+                // there must be a PostWriteCc request waiting to be
+                // executed. So, this read should wait for the PostWriteCc
+                // completed.
+                NonBlockingLock *key_lock = cce->GetKeyLock();
+                assert(key_lock != nullptr && key_lock->HasWriteLock() &&
+                       key_lock->WriteLockTx() != req.Txn());
+                // Put the request to top of key lock's blocking queue with
+                // acquring readlock. And then should release the readlock
+                // before handling this requst when PostWriteCc finished.
+                key_lock->InsertBlockingQueue(&req, LockType::ReadLock);
+                shard_->CheckRecoverTx(key_lock->WriteLockTx(), ng_id, ng_term);
+
+                // After inserting to blocking queue, the execution of
+                // current ReadCc request should stop.
+                co_yield false;
+
+                cce->GetKeyLock()->ReleaseReadLock(req.Txn(), shard_);
+            }
+            else
+            {
+                // safe to read the record
+                if (req.Record() != nullptr)
+                {
+                    ValueT *typed_rec = static_cast<ValueT *>(req.Record());
+                    *typed_rec = *(cce->payload_.cur_payload_);
+                }
+                else
+                {
+                    assert(req.RecordBlob() != nullptr);
+                    cce->payload_.cur_payload_->Serialize(*req.RecordBlob());
+                }
+            }
+        }
+
+        hd_res->Value().ts_ = cce->CommitTs();
+        hd_res->Value().rec_status_ = cce->PayloadStatus();
+        hd_res->SetFinished();
+
+        co_yield true;
+    }
+
     absl::btree_map<
         KeyT,
         std::unique_ptr<
@@ -12042,8 +12713,8 @@ protected:
     CcEntry<KeyT, ValueT, VersionedRecord, RangePartitioned> neg_inf_, pos_inf_;
 
     TemplateCcMapSamplePool<KeyT> *sample_pool_;
-    size_t
-        size_{};  // The count of all records, including ones in deleted status.
+    size_t size_{};  // The count of all records, including ones in deleted
+                     // status.
     size_t normal_obj_sz_{
         0};  // The count of all normal status objects, only used for redis
 };

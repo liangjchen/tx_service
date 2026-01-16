@@ -19,6 +19,8 @@
  *    <http://www.gnu.org/licenses/>.
  *
  */
+#include "cc/cc_shard.h"
+
 #include <brpc/controller.h>
 #include <bthread/bthread.h>
 #include <bthread/remote_task_queue.h>
@@ -29,7 +31,6 @@
 
 #include "cc/catalog_cc_map.h"
 #include "cc/cc_request.h"
-#include "cc/cc_shard.h"
 #include "cc/cluster_config_cc_map.h"
 #include "cc/non_blocking_lock.h"  // lock_vec_
 #include "cc/range_bucket_cc_map.h"
@@ -190,6 +191,14 @@ CcShard::CcShard(
 
     retry_fwd_msg_cc_ = std::make_unique<RetryFailedStandbyMsgCc>();
     shard_clean_cc_ = std::make_unique<ShardCleanCc>();
+}
+
+CcShard::~CcShard()
+{
+    while (coro_head_ != nullptr)
+    {
+        coro_head_ = std::move(coro_head_->next_);
+    }
 }
 
 void CcShard::Init()
@@ -2980,6 +2989,33 @@ void CcShard::CollectCacheMiss()
 {
     assert(metrics::enable_cache_hit_rate);
     meter_->Collect(metrics::NAME_CACHE_HIT_OR_MISS_TOTAL, 1, "miss");
+}
+
+CcCoro::uptr CcShard::NewCcCoro()
+{
+    if (coro_head_ != nullptr)
+    {
+        CcCoro::uptr coro = std::move(coro_head_);
+        coro_head_ = std::move(coro->next_);
+        return coro;
+    }
+    else
+    {
+        return std::make_unique<CcCoro>(this);
+    }
+}
+
+void CcShard::RecycleCcCoro(CcCoro::uptr coro)
+{
+    assert(coro != nullptr);
+    coro->Free();
+    coro->next_ = std::move(coro_head_);
+    coro_head_ = std::move(coro);
+}
+
+CoroSharedAllocator *CcShard::GetSharedAllocator()
+{
+    return &coro_shared_alloc_;
 }
 
 }  // namespace txservice

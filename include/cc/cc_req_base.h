@@ -25,6 +25,7 @@
 
 #include <atomic>
 
+#include "cc_coro.h"
 #include "cc_protocol.h"
 #include "error_messages.h"
 #include "tx_id.h"
@@ -54,10 +55,7 @@ public:
         return in_use_.load(std::memory_order_acquire);
     }
 
-    virtual void Free()
-    {
-        in_use_.store(false, std::memory_order_release);
-    }
+    virtual void Free();
 
     void Use()
     {
@@ -92,12 +90,23 @@ public:
         return 0;
     }
 
+    void SetCcCoro(CcCoro::uptr coro)
+    {
+        coro_ = std::move(coro);
+    }
+
+    CcCoro::uptr GetCcCoro()
+    {
+        return std::move(coro_);
+    }
+
 protected:
     CcRequestBase() = default;
 
-    std::atomic<bool> in_use_{false};
     TxNumber tx_number_{0};
+    std::atomic<bool> in_use_{false};
     CcProtocol proto_{CcProtocol::OCC};
     IsolationLevel isolation_level_{IsolationLevel::ReadCommitted};
+    CcCoro::uptr coro_{nullptr};
 };
 }  // namespace txservice

@@ -39,7 +39,7 @@ namespace txservice
  * - "Pessimistic Write" : WriteLock and WriteIntent. Confilict: block and wait.
  *
  */
-enum class CcProtocol
+enum class CcProtocol : uint8_t
 {
     OCC = 0,  // Optimistic Read + Optimistic Write
     OccRead,  // Optimistic Read + Pessimistic Write
@@ -63,7 +63,7 @@ enum class CcOperation : uint8_t
  * all CcProtocol.
  *
  */
-enum class IsolationLevel
+enum class IsolationLevel : uint8_t
 {
     ReadCommitted = 0,
     Snapshot,

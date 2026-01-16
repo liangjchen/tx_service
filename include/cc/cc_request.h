@@ -83,10 +83,6 @@
 
 namespace txservice
 {
-thread_local inline CcRequestPool<ReplayLogCc> replay_cc_pool_;
-thread_local inline CcRequestPool<KeyObjectStandbyForwardCc>
-    key_obj_standby_forward_pool_;
-
 template <typename KeyT,
           typename ValueT,
           bool VersionedRecord,
@@ -284,6 +280,16 @@ public:
     int64_t TxTerm() const
     {
         return tx_term_;
+    }
+
+    int64_t NodeGroupTerm() const
+    {
+        return ng_term_;
+    }
+
+    void SetNodeGroupTerm(int64_t term)
+    {
+        ng_term_ = term;
     }
 
     void Reset(const TableName *tname,
@@ -3691,12 +3697,11 @@ public:
         if (!export_base_table_item_)
         {
             slices_to_scan_.reserve(old_slices_delta_size->size());
-            std::for_each(old_slices_delta_size->begin(),
-                          old_slices_delta_size->end(),
-                          [&](decltype(*old_slices_delta_size->begin()) &elem) {
-                              slices_to_scan_.emplace_back(
-                                  std::move(elem.first.GetShallowCopy()));
-                          });
+            std::for_each(
+                old_slices_delta_size->begin(),
+                old_slices_delta_size->end(),
+                [&](decltype(*old_slices_delta_size->begin()) &elem)
+                { slices_to_scan_.emplace_back(elem.first.GetShallowCopy()); });
         }
         for (size_t i = 0; i < core_cnt; i++)
         {
@@ -4573,6 +4578,10 @@ private:
                                     txservice::ReplayLogCc *r);
 };
 
+thread_local inline CcRequestPool<ReplayLogCc> replay_cc_pool;
+// thread_local inline CcRequestPool<KeyObjectStandbyForwardCc>
+//     key_obj_standby_forward_pool_;
+
 struct ParseDataLogCc : public CcRequestBase
 {
 public:
@@ -4677,7 +4686,7 @@ public:
                                   ->KeyHash(blob.data(), blob_offset, nullptr);
                 dest_core = hash ? (hash & 0x3FF) % ccs.core_cnt_
                                  : (dest_core + 1) % ccs.core_cnt_;
-                ReplayLogCc *cc_req = replay_cc_pool_.NextRequest();
+                ReplayLogCc *cc_req = replay_cc_pool.NextRequest();
                 replay_cc_list.push_back(cc_req);
                 assert(cc_ng_term_ >= 0);
                 cc_req->Reset(

@@ -238,6 +238,19 @@ public:
         return false;
     }
 
+    double PosInInterval(const RangeBucketKey &min_key,
+                         const RangeBucketKey &max_key) const
+    {
+        return 0.5;
+    }
+
+    double PosInInterval(const txservice::KeySchema *key_schema,
+                         const RangeBucketKey &min_key,
+                         const RangeBucketKey &max_key) const
+    {
+        return 0.5;
+    }
+
     static const RangeBucketKey *NegativeInfinity()
     {
         static const RangeBucketKey neg_inf;
@@ -248,6 +261,24 @@ public:
     {
         static const RangeBucketKey pos_inf;
         return &pos_inf;
+    }
+
+    static const RangeBucketKey *PackedNegativeInfinity()
+    {
+        return NegativeInfinity();
+    }
+
+    static const txservice::TxKey *PackedNegativeInfinityTxKey()
+    {
+        static const txservice::TxKey negative_infinity_tx_key{
+            NegativeInfinity()};
+        return &negative_infinity_tx_key;
+    }
+
+    static RangeBucketKey PackedPositiveInfinity(
+        const txservice::KeySchema *key_schema)
+    {
+        return {};
     }
 
     uint16_t BucketId() const

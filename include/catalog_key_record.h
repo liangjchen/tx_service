@@ -114,6 +114,19 @@ public:
         return Size();
     }
 
+    double PosInInterval(const CatalogKey &min_key,
+                         const CatalogKey &max_key) const
+    {
+        return 0.5;
+    }
+
+    double PosInInterval(const txservice::KeySchema *key_schema,
+                         const CatalogKey &min_key,
+                         const CatalogKey &max_key) const
+    {
+        return 0.5;
+    }
+
     static const CatalogKey *NegativeInfinity()
     {
         static const CatalogKey neg_inf;
@@ -130,6 +143,24 @@ public:
     {
         static const TxKeyInterface tx_key_impl{CatalogKey()};
         return &tx_key_impl;
+    }
+
+    static const CatalogKey *PackedNegativeInfinity()
+    {
+        return NegativeInfinity();
+    }
+
+    static const txservice::TxKey *PackedNegativeInfinityTxKey()
+    {
+        static const txservice::TxKey negative_infinity_tx_key{
+            NegativeInfinity()};
+        return &negative_infinity_tx_key;
+    }
+
+    static CatalogKey PackedPositiveInfinity(
+        const txservice::KeySchema *key_schema)
+    {
+        return {};
     }
 
 private:

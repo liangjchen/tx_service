@@ -1012,7 +1012,8 @@ void LocalCcShards::InitTableRanges(const TableName &range_table_name,
                 GetCatalogFactory(range_table_name.Engine())
                     ->CreateTableRange(std::move(range_start_key),
                                        range_entry.version_ts_,
-                                       range_entry.partition_id_);
+                                       range_entry.partition_id_,
+                                       nullptr);
             range_it = ranges
                            .try_emplace(new_range->RangeStartTxKey(),
                                         std::move(new_range))
@@ -3192,10 +3193,9 @@ void LocalCcShards::DataSyncForRangePartition(
                 CcErrorCode::REQUESTED_NODE_NOT_LEADER);
         }
 
-        defer_unpin = std::move(std::shared_ptr<void>(
+        defer_unpin = std::shared_ptr<void>(
             nullptr,
-            [ng_id](void *)
-            { Sharder::Instance().UnpinNodeGroupData(ng_id); }));
+            [ng_id](void *) { Sharder::Instance().UnpinNodeGroupData(ng_id); });
 
         // Process this task.
         // 1. Get a new txm and init

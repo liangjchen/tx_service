@@ -1033,6 +1033,18 @@ struct alignas(2) VoidKey
         return false;
     }
 
+    double PosInInterval(const VoidKey &min_key, const VoidKey &max_key) const
+    {
+        return 0.5;
+    }
+
+    double PosInInterval(const txservice::KeySchema *key_schema,
+                         const VoidKey &min_key,
+                         const VoidKey &max_key) const
+    {
+        return 0.5;
+    }
+
     static const VoidKey *NegativeInfinity()
     {
         static const VoidKey neg_inf;
@@ -1061,6 +1073,24 @@ struct alignas(2) VoidKey
     {
         static const TxKeyInterface tx_key_impl{*VoidKey::NegativeInfinity()};
         return &tx_key_impl;
+    }
+
+    static const VoidKey *PackedNegativeInfinity()
+    {
+        return NegativeInfinity();
+    }
+
+    static const txservice::TxKey *PackedNegativeInfinityTxKey()
+    {
+        static const txservice::TxKey negative_infinity_tx_key{
+            NegativeInfinity()};
+        return &negative_infinity_tx_key;
+    }
+
+    static VoidKey PackedPositiveInfinity(
+        const txservice::KeySchema *key_schema)
+    {
+        return {};
     }
 };
 

@@ -42,6 +42,7 @@
 #include "catalog_factory.h"
 #include "catalog_key_record.h"
 #include "cc/non_blocking_lock.h"
+#include "cc_coro.h"
 #include "cc_entry.h"
 #include "cc_map.h"
 #include "cc_req_base.h"
@@ -49,6 +50,7 @@
 #include "cc_req_pool.h"
 #include "cc_request.pb.h"
 #include "cc_stream_sender.h"
+#include "coro_allocator.h"
 #include "error_messages.h"
 #include "meter.h"
 #include "metrics.h"
@@ -225,6 +227,8 @@ public:
             uint64_t cluster_config_version,
             metrics::MetricsRegistry *metrics_registry = nullptr,
             metrics::CommonLabels common_labels = {});
+
+    ~CcShard();
 
     void Init();
 
@@ -1017,6 +1021,10 @@ public:
     void CollectCacheHit();
     void CollectCacheMiss();
 
+    CcCoro::uptr NewCcCoro();
+    void RecycleCcCoro(CcCoro::uptr coro);
+    CoroSharedAllocator *GetSharedAllocator();
+
 private:
     void SetTxProcNotifier(std::atomic<TxProcessorStatus> *tx_proc_status,
                            TxProcCoordinator *tx_coordi)
@@ -1207,6 +1215,9 @@ private:
     // ApplyCc(exec_rst == ExecResult::Block), uint64_t here is the timestamp
     // when the transaction was inserted into this map.
     std::unordered_map<TxNumber, uint64_t> active_blocking_txs_;
+
+    CcCoro::uptr coro_head_{nullptr};
+    CoroSharedAllocator coro_shared_alloc_;
 
     friend class LocalCcHandler;
     friend class LocalCcShards;
